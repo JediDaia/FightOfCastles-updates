@@ -1,0 +1,115 @@
+name: Distribute signed game update
+on:
+  push:
+    branches: ['incoming/**']
+permissions:
+  contents: write
+concurrency:
+  group: signed-game-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.event.deleted != true
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Read trusted distribution configuration
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: control
+          persist-credentials: false
+      - name: Read exact signed delivery commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.after }}
+          path: incoming
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download pinned publisher binaries
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import hashlib,json,os,urllib.request,zipfile
+          from pathlib import Path,PurePosixPath
+          meta=json.loads(Path('control/publisher-tools.json').read_text())
+          assert meta['url'].startswith('https://github.com/JediDaia/FightOfCastles-updates/releases/download/')
+          target=Path(os.environ['RUNNER_TEMP'])/'publisher-tools.zip'
+          urllib.request.urlretrieve(meta['url'],target)
+          assert hashlib.sha256(target.read_bytes()).hexdigest()==meta['sha256'], 'Publisher archive digest mismatch'
+          with zipfile.ZipFile(target) as archive:
+              for item in archive.infolist():
+                  p=PurePosixPath(item.filename)
+                  assert not p.is_absolute() and '..' not in p.parts and len(p.parts)<=3
+                  assert not ((item.external_attr>>16)&0o170000)==0o120000
+                  assert item.file_size<20*1024*1024
+              archive.extractall(Path(os.environ['RUNNER_TEMP']))
+          root=Path(os.environ['RUNNER_TEMP'])/'publisher-tools'
+          for name in ['foc-release','foc-github-publisher']:
+              (root/name).chmod(0o755)
+          c=json.loads((root/'launcher-config.json').read_text())
+          assert c['publicKey']==meta['publicKey'] and not c['allowLocalFeed'] and c['githubReleaseShards'] is True
+          assert c['feedBaseURL']=='https://github.com/JediDaia/FightOfCastles-updates/releases/download'
+          PYTHON
+      - name: Validate signature, request and binary-only payload
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import base64,hashlib,json,os,re,subprocess
+          from pathlib import Path
+          source=Path('incoming/delivery')
+          request=source/'request.json'
+          assert request.is_file() and not request.is_symlink() and request.stat().st_size<4096
+          r=json.loads(request.read_text())
+          assert r['schema']==1 and r['sourceRepository']=='wrackerberry/FightOfCastles'
+          assert re.fullmatch('[a-f0-9]{40}',r['sourceCommit'])
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?',r['releaseTag'])
+          assert r['version']==r['releaseTag'][1:] and r['channel'] in ['alpha','stable']
+          pointer=source/'channels'/f"{r['channel']}.json"
+          data=pointer.read_bytes()
+          assert len(data)<=8*1024*1024 and hashlib.sha256(data).hexdigest()==r['manifestSHA256']
+          tools=Path(os.environ['RUNNER_TEMP'])/'publisher-tools'
+          config=json.loads((tools/'launcher-config.json').read_text())
+          key=Path(os.environ['RUNNER_TEMP'])/'foc-public-key.txt'
+          key.write_text(config['publicKey'])
+          subprocess.run([str(tools/'foc-release'),'verify','--feed',str(source),'--public-key',str(key),'--channel',r['channel']],check=True)
+          m=json.loads(base64.b64decode(json.loads(data)['payload'],validate=True))
+          assert m['sourceCommit']==r['sourceCommit'] and m['version']==r['version'] and m['channel']==r['channel']
+          expected={'request.json',f"channels/{r['channel']}.json"}
+          for file in m['files']:
+              expected.update('blobs/'+chunk['sha256'] for chunk in file['chunks'])
+          actual=set()
+          for p in source.rglob('*'):
+              assert not p.is_symlink(), 'Symlink in delivery'
+              if p.is_file():actual.add(p.relative_to(source).as_posix())
+          assert actual==expected, 'Unexpected delivery files'
+          def tree(folder):
+              text=subprocess.check_output(['git','-C',folder,'ls-tree','-r','HEAD'],text=True)
+              return dict((line.split('\t',1)[1],line.split('\t',1)[0]) for line in text.splitlines())
+          trusted=tree('control'); candidate=tree('incoming')
+          for path,identity in candidate.items():
+              assert path.startswith('delivery/') or trusted.get(path)==identity, 'Unexpected repository file: '+path
+          with open(os.environ['GITHUB_ENV'],'a') as out:out.write('FOC_CHANNEL='+r['channel']+'\n')
+          PYTHON
+      - name: Publish verified blocks and advance channel last
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/publisher-tools/foc-github-publisher" --feed incoming/delivery --config "$RUNNER_TEMP/publisher-tools/launcher-config.json" --release-tool "$RUNNER_TEMP/publisher-tools/foc-release" --channel "$FOC_CHANNEL" | tee "$RUNNER_TEMP/publication-report.json"
+      - name: Remove completed temporary delivery branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DELIVERY_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$DELIVERY_BRANCH" == incoming/* ]]
+          gh api --hostname github.com --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$DELIVERY_BRANCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: publication-report
+          path: ${{ runner.temp }}/publication-report.json
+          if-no-files-found: error
+          retention-days: 30
