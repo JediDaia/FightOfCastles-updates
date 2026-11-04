@@ -103,10 +103,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DELIVERY_BRANCH: ${{ github.ref_name }}
+          DELIVERY_SHA: ${{ github.event.after }}
         run: |
-          set -euo pipefail
-          [[ "$DELIVERY_BRANCH" == incoming/* ]]
-          gh api --hostname github.com --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$DELIVERY_BRANCH"
+          python3 - <<'PYTHON'
+          import json,os,subprocess
+          branch=os.environ['DELIVERY_BRANCH']; assert branch.startswith('incoming/')
+          endpoint='repos/'+os.environ['GITHUB_REPOSITORY']+'/git/refs/heads/'+branch
+          result=subprocess.run(['gh','api','--hostname','github.com',endpoint],capture_output=True,text=True)
+          if result.returncode:
+              if 'HTTP 404' in result.stderr:raise SystemExit(0)
+              raise SystemExit(result.stderr)
+          if json.loads(result.stdout)['object']['sha']!=os.environ['DELIVERY_SHA']:
+              print('Delivery branch advanced; keeping it')
+              raise SystemExit(0)
+          result=subprocess.run(['gh','api','--hostname','github.com','--method','DELETE',endpoint],capture_output=True,text=True)
+          if result.returncode and 'HTTP 404' not in result.stderr:raise SystemExit(result.stderr)
+          PYTHON
       - uses: actions/upload-artifact@v4
         with:
           name: publication-report
