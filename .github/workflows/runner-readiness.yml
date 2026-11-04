@@ -1,0 +1,23 @@
+name: Runner readiness
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 5
+    steps:
+      - run: |
+          sw_vers
+          swift --version
+          python3 --version
+          gh --version
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          uname -a
+          python3 --version
+          gh --version
